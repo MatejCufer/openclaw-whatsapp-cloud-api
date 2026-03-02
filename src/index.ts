@@ -324,6 +324,14 @@ const whatsappCloudChannel = {
             // Load fresh config for dispatch
             const freshCfg = await runtime.config.loadConfig();
 
+            // Resolve agent routing via bindings
+            const route = runtime.channel.routing.resolveAgentRoute({
+              cfg: freshCfg,
+              channel: "whatsapp-cloud",
+              accountId: account.accountId,
+              peer: { kind: "direct", id: message.from },
+            });
+
             // Build MsgContext (OpenClaw's standard inbound message format)
             const msgCtx: Record<string, any> = {
               Body: message.text,
@@ -332,8 +340,8 @@ const whatsappCloudChannel = {
               BodyForCommands: message.text,
               From: message.from,
               To: config.phoneNumberId,
-              SessionKey: `whatsapp-cloud:${message.from}`,
-              AccountId: account.accountId,
+              SessionKey: route.sessionKey,
+              AccountId: route.accountId,
               MessageSid: message.messageId,
               ChatType: "direct",
               SenderName: message.senderName,

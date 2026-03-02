@@ -409,6 +409,20 @@ openclaw whatsapp-cloud test +39XXXXXXXXXX
 - DM policy (open / allowlist)
 - Phone number normalization for allowlist matching
 
+## Multi-agent routing
+
+This plugin uses OpenClaw's `resolveAgentRoute` API to honor `bindings` in your config. If you run multiple agents, bind the WhatsApp Cloud channel to a specific agent:
+
+```json5
+{
+  bindings: [
+    { agentId: "monica", match: { channel: "whatsapp-cloud" } },
+  ],
+}
+```
+
+All inbound WhatsApp messages will be routed to the matched agent with a properly scoped session key (`agent:<agentId>:whatsapp-cloud:direct:<phone>`). See [Multi-Agent Routing](https://docs.openclaw.ai/concepts/multi-agent) for details.
+
 ## The 24-hour messaging window
 
 WhatsApp Cloud API enforces a **24-hour customer service window**:
