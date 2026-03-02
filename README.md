@@ -431,11 +431,26 @@ WhatsApp Cloud API enforces a **24-hour customer service window**:
 - After the window closes, you can only send **pre-approved template messages**
 - Each template must be submitted to Meta for review
 
-This plugin handles free-form responses automatically. For proactive notifications, use the `sendTemplate` API:
+This plugin handles free-form responses automatically. For proactive outreach, the plugin registers a **`whatsapp_send_template`** agent tool that lets your AI agent send templates directly:
 
-```typescript
-import { sendTemplate } from "@baia-digitale/whatsapp-cloud";
 ```
+whatsapp_send_template({
+  to: "38651313135",
+  template: "your_template_name",
+  language: "en",
+  components: [
+    {
+      type: "body",
+      parameters: [
+        { type: "text", text: "Name" },
+        { type: "text", text: "Your message here" }
+      ]
+    }
+  ]
+})
+```
+
+Templates must be pre-approved in the [Meta WhatsApp Business Manager](https://business.facebook.com/). The tool is available to all agents that have the WhatsApp Cloud channel bound to them.
 
 ## Development
 

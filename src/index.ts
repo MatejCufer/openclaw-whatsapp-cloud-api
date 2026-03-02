@@ -10,7 +10,7 @@
 // ---------------------------------------------------------------------------
 
 import type { Server } from "node:http";
-import { sendText, sendMedia, sendTypingIndicator } from "./api.js";
+import { sendText, sendTemplate, sendMedia, sendTypingIndicator } from "./api.js";
 import { startWebhookServer } from "./webhook.js";
 import { runSetupWizard, validateConfig } from "./setup.js";
 import { whatsappCloudOnboardingAdapter } from "./onboarding.js";
@@ -502,6 +502,116 @@ const plugin = {
 
     // Register the channel
     api.registerChannel({ plugin: whatsappCloudChannel });
+
+    // Register agent tool for sending WhatsApp templates
+    if (typeof api.registerTool === "function") {
+      api.registerTool({
+        name: "whatsapp_send_template",
+        description:
+          "Send a WhatsApp message template. Required for first-ever outbound messages to a contact or when the 24-hour conversation window has expired. Use the 'message' tool for free-form text within an active 24h window.",
+        parameters: {
+          type: "object",
+          properties: {
+            to: {
+              type: "string",
+              description: "Recipient phone number in E.164 format without '+' (e.g. 38651313135)",
+            },
+            template: {
+              type: "string",
+              description:
+                "Approved template name (e.g. monica_relay, monica_followup)",
+            },
+            language: {
+              type: "string",
+              description: "Template language code (default: en)",
+            },
+            components: {
+              type: "array",
+              description:
+                'Template variable components. Each element: { "type": "body"|"header"|"button", "parameters": [{ "type": "text", "text": "value" }] }',
+              items: {
+                type: "object",
+                properties: {
+                  type: {
+                    type: "string",
+                    enum: ["header", "body", "button"],
+                  },
+                  parameters: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      properties: {
+                        type: { type: "string" },
+                        text: { type: "string" },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+          required: ["to", "template"],
+        },
+        async execute(_id: string, params: any) {
+          try {
+            const runtime = getWhatsAppCloudRuntime();
+            const cfg = await runtime.config.loadConfig();
+            const config = resolveConfig(cfg);
+
+            if (!config.accessToken || !config.phoneNumberId) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: "Error: WhatsApp Cloud API not configured (missing accessToken or phoneNumberId).",
+                  },
+                ],
+              };
+            }
+
+            const result = await sendTemplate(
+              config,
+              String(params.to).replace(/\+/g, ""),
+              params.template,
+              params.language ?? "en",
+              params.components,
+              log
+            );
+
+            if (result.ok) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `Template "${params.template}" sent to ${params.to} (messageId: ${result.messageId}).`,
+                  },
+                ],
+              };
+            }
+
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Failed to send template "${params.template}" to ${params.to}: ${result.error}`,
+                },
+              ],
+            };
+          } catch (err: any) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Error sending template: ${err.message ?? err}`,
+                },
+              ],
+            };
+          }
+        },
+      });
+
+      log.info("[whatsapp-cloud] Registered agent tool: whatsapp_send_template");
+    }
 
     // Register CLI commands: `openclaw whatsapp-cloud setup|status|test`
     if (typeof api.registerCli === "function") {
