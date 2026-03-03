@@ -430,8 +430,20 @@ WhatsApp Cloud API enforces a **24-hour customer service window**:
 - When a customer messages you, you have **24 hours** to respond with free-form text
 - After the window closes, you can only send **pre-approved template messages**
 - Each template must be submitted to Meta for review
+- A valid **payment method** must be linked to your WhatsApp Business Account for business-initiated (template) messages to deliver
 
-This plugin handles free-form responses automatically. For proactive outreach, the plugin registers a **`whatsapp_send_template`** agent tool that lets your AI agent send templates directly:
+### Automatic window detection
+
+The plugin tracks the last inbound message timestamp per phone number (persisted to `~/.openclaw/whatsapp-cloud-windows.json`). When an outbound free-form message is attempted:
+
+- **Window open** (< 23h since last inbound) → sends as normal free-form text
+- **Window expired** (≥ 23h) → automatically falls back to a configurable template
+
+The fallback template defaults to `monica_followup`. This means your agent doesn't need to manually decide between free-form and template messages — the plugin handles it transparently.
+
+### Manual template sending
+
+For first-ever outbound messages or when you need a specific template, the plugin registers a **`whatsapp_send_template`** agent tool:
 
 ```
 whatsapp_send_template({
@@ -497,6 +509,11 @@ New WhatsApp Business accounts start at **250 unique recipients per 24 hours**. 
 - Check that you subscribed to the `messages` webhook field in Meta dashboard
 - Check logs: `journalctl --user -u openclaw-gateway.service -f`
 - Verify `appSecret` is correct (wrong secret = messages silently dropped)
+
+**Template messages accepted by API but never delivered:**
+- Verify a **payment method** is linked to the correct WhatsApp Business Account in Meta Business Manager. Without one, the API returns `accepted` but silently drops business-initiated messages.
+- Check that the template status is `APPROVED` (not just `PENDING`)
+- Newly approved templates may take up to a few hours to fully propagate
 
 **"phoneNumberId?.trim is not a function":**
 - The `phoneNumberId` was saved as a number instead of a string. Fix it in `~/.openclaw/openclaw.json` by wrapping the value in quotes: `"phoneNumberId": "878388375365101"`
