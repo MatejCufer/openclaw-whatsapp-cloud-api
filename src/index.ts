@@ -38,6 +38,65 @@ let webhookServer: Server | null = null;
 const DEFAULT_ACCOUNT_ID = "default";
 
 // ---------------------------------------------------------------------------
+// 24-hour conversation window tracker
+// Tracks last inbound message timestamp per phone number.
+// Used to auto-fallback to template when the 24h window has expired.
+// ---------------------------------------------------------------------------
+
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { join, dirname } from "node:path";
+
+const WINDOW_TRACKER_PATH = join(
+  process.env.HOME ?? "/tmp",
+  ".openclaw",
+  "whatsapp-cloud-windows.json"
+);
+const WINDOW_HOURS = 23; // 1h safety buffer before actual 24h expiry
+
+const windowMap: Map<string, number> = new Map();
+
+function loadWindowTracker(): void {
+  try {
+    const raw = readFileSync(WINDOW_TRACKER_PATH, "utf-8");
+    const data = JSON.parse(raw) as Record<string, number>;
+    for (const [phone, ts] of Object.entries(data)) {
+      windowMap.set(phone, ts);
+    }
+  } catch {
+    // File doesn't exist yet or is corrupted -- start fresh
+  }
+}
+
+function saveWindowTracker(): void {
+  try {
+    mkdirSync(dirname(WINDOW_TRACKER_PATH), { recursive: true });
+    const data: Record<string, number> = {};
+    for (const [phone, ts] of windowMap) {
+      data[phone] = ts;
+    }
+    writeFileSync(WINDOW_TRACKER_PATH, JSON.stringify(data, null, 2));
+  } catch {
+    // Non-critical -- worst case we fall back to template
+  }
+}
+
+function recordInbound(phone: string): void {
+  windowMap.set(phone.replace(/[^0-9]/g, ""), Date.now());
+  saveWindowTracker();
+}
+
+function isWindowOpen(phone: string): boolean {
+  const normalized = phone.replace(/[^0-9]/g, "");
+  const lastInbound = windowMap.get(normalized);
+  if (!lastInbound) return false;
+  const elapsed = Date.now() - lastInbound;
+  return elapsed < WINDOW_HOURS * 60 * 60 * 1000;
+}
+
+// Load persisted tracker on startup
+loadWindowTracker();
+
+// ---------------------------------------------------------------------------
 // Config resolution
 // ---------------------------------------------------------------------------
 
@@ -234,6 +293,39 @@ const whatsappCloudChannel = {
         throw new Error("WhatsApp Cloud API not configured: missing accessToken or phoneNumberId");
       }
 
+      const normalizedTo = to.replace(/[^0-9]/g, "");
+
+      // Auto-fallback: if 24h window is expired, send via template
+      if (!isWindowOpen(normalizedTo)) {
+        log.info?.(`[whatsapp-cloud] 24h window expired for ${normalizedTo} — falling back to template`);
+        const templateResult = await sendTemplate(
+          config,
+          normalizedTo,
+          "monica_followup",
+          "en",
+          [
+            {
+              type: "body",
+              parameters: [
+                { type: "text", text: "there" },
+                { type: "text", text: text.slice(0, 900) },
+              ],
+            },
+          ],
+          log
+        );
+
+        if (!templateResult.ok) {
+          throw new Error(`WhatsApp Cloud API template fallback failed: ${templateResult.error}`);
+        }
+
+        return {
+          channel: "whatsapp-cloud" as any,
+          messageId: templateResult.messageId ?? "unknown",
+          chatId: to,
+        };
+      }
+
       const result = await sendText(config, to, text, log);
 
       if (!result.ok) {
@@ -318,6 +410,9 @@ const whatsappCloudChannel = {
         // Inbound message handler — dispatch into OpenClaw agent session
         async (message) => {
           try {
+            // Track inbound for 24h conversation window
+            recordInbound(message.from);
+
             // Show typing indicator immediately (auto-dismissed on reply or after 25s)
             sendTypingIndicator(config, message.messageId, log).catch(() => {});
 
