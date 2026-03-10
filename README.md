@@ -110,7 +110,15 @@ User on WhatsApp
       v
 Meta Cloud API (graph.facebook.com)
       |
-      v  HTTPS POST
+      v  HTTPS POST (webhook)
++--------------------------------------------------+
+|  n8n Cloud (optional relay)                      |
+|    - receives Meta webhooks                      |
+|    - forwards to VPS with bearer token auth      |
+|    - retries on failure, Telegram alerting       |
++--------------------------------------------------+
+      |
+      v  HTTPS POST (relay or direct)
 +--------------------------------------------------+
 |  Your server (VPS / Docker / Cloud)              |
 |                                                  |
@@ -126,6 +134,10 @@ Meta Cloud API (graph.facebook.com)
 |    +-- agent (Claude / GPT / ...)                |
 +--------------------------------------------------+
 ```
+
+The plugin supports two inbound paths:
+- **Direct**: Meta sends webhooks straight to your server (verified via HMAC-SHA256)
+- **n8n relay**: Meta sends webhooks to n8n Cloud, which forwards them to `/webhook/whatsapp-relay` with bearer token auth — adds retry, logging, and alerting
 
 ### Recommended repo structure
 
@@ -282,6 +294,7 @@ cd ~/extensions/whatsapp-cloud && git pull && npm install && npm run build && sy
 ```
 yourdomain.com {
     reverse_proxy /webhook/whatsapp-cloud localhost:3100
+    reverse_proxy /webhook/whatsapp-relay localhost:3100
 }
 ```
 
@@ -301,6 +314,14 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/yourdomain.com/privkey.pem;
 
     location /webhook/whatsapp-cloud {
+        proxy_pass http://127.0.0.1:3100;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location /webhook/whatsapp-relay {
         proxy_pass http://127.0.0.1:3100;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
@@ -350,6 +371,9 @@ openclaw gateway status
 
 # Send a test message
 openclaw whatsapp-cloud test +39XXXXXXXXXX
+
+# Audit log (structured JSONL of all webhook events)
+tail -f ~/.openclaw/whatsapp-cloud-audit.jsonl | jq .
 ```
 
 ### Security checklist
@@ -361,6 +385,7 @@ openclaw whatsapp-cloud test +39XXXXXXXXXX
 - [ ] `.env` file has `chmod 600` and is not committed to git
 - [ ] Gateway auth token is set (`gateway.auth.mode: "token"`)
 - [ ] Gateway binds to loopback only (reverse proxy handles external traffic)
+- [ ] n8n relay token (if using relay) stored in `~/.secrets/n8n/whatsapp-relay-token` with `chmod 600`
 
 ---
 
@@ -376,6 +401,7 @@ openclaw whatsapp-cloud test +39XXXXXXXXXX
 | `verifyToken` | string | `"openclaw-wa-cloud-verify"` | Custom token for webhook endpoint verification |
 | `webhookPort` | number | `3100` | HTTP server port for webhooks |
 | `webhookPath` | string | `"/webhook/whatsapp-cloud"` | URL path for the webhook endpoint |
+| `relayPath` | string | `"/webhook/whatsapp-relay"` | URL path for the n8n relay endpoint |
 | `apiVersion` | string | `"v21.0"` | Meta Graph API version |
 | `dmPolicy` | string | `"open"` | `"open"` (anyone) or `"allowlist"` (restricted) |
 | `allowFrom` | string[] | `[]` | E.164 numbers allowed when dmPolicy=allowlist |
@@ -402,10 +428,36 @@ openclaw whatsapp-cloud test +39XXXXXXXXXX
 - Template messages (for messages outside the 24h window)
 - Read receipts
 
+### Agent tools
+
+The plugin registers two agent tools available to any bound agent:
+
+- **`whatsapp_send`** — Send a text message directly via the API. Works from any session context (Telegram, WhatsApp, cron) without cross-context errors or session fragmentation. Handles 24h window expiry automatically (falls back to template).
+- **`whatsapp_send_template`** — Send a specific pre-approved template message. Use for first-ever outbound contact or when a particular template is required.
+
+### n8n relay
+
+An optional relay path (`/webhook/whatsapp-relay`) accepts webhooks forwarded by n8n Cloud with bearer token authentication. This adds:
+
+- **Retry logic**: n8n retries delivery if the VPS is temporarily unreachable
+- **Execution logging**: full webhook history in n8n's execution log
+- **Alerting**: configurable Telegram/email alerts on forwarding failure
+
+To configure: store the relay bearer token at `~/.secrets/n8n/whatsapp-relay-token`. The token is loaded on gateway startup. If no token file exists, the relay path returns 503.
+
+### Audit logging
+
+All webhook events (inbound messages, signature failures, relay auth failures, parse errors, blocked messages) are written as structured JSONL to `~/.openclaw/whatsapp-cloud-audit.jsonl`. Non-critical — logging failures never block message processing.
+
+### Auto session cleanup
+
+On every gateway startup, the plugin scans the agent's `sessions.json` and removes any `whatsapp-cloud:group:` session artifacts and stale Baileys sessions. These artifacts are created when OpenClaw's built-in `message send` delivery system is used instead of the `whatsapp_send` tool, and would otherwise fragment conversation history across duplicate sessions.
+
 ### Security
 
 - HMAC-SHA256 webhook signature verification (via App Secret)
 - Timing-safe comparison to prevent timing attacks
+- Bearer token authentication for n8n relay path
 - DM policy (open / allowlist)
 - Phone number normalization for allowlist matching
 
@@ -441,9 +493,17 @@ The plugin tracks the last inbound message timestamp per phone number (persisted
 
 The fallback template defaults to `monica_followup`. This means your agent doesn't need to manually decide between free-form and template messages — the plugin handles it transparently.
 
-### Manual template sending
+### Sending messages (agent tools)
 
-For first-ever outbound messages or when you need a specific template, the plugin registers a **`whatsapp_send_template`** agent tool:
+**`whatsapp_send`** — the recommended way to send all outbound WhatsApp messages:
+
+```
+whatsapp_send({ to: "38631651745", text: "Your message here" })
+```
+
+Works from any session context. If the 24h window is open, sends free-form text. If expired, automatically falls back to a template. No session artifacts are created.
+
+**`whatsapp_send_template`** — for first-ever outbound contact or when a specific template is required:
 
 ```
 whatsapp_send_template({
@@ -462,7 +522,7 @@ whatsapp_send_template({
 })
 ```
 
-Templates must be pre-approved in the [Meta WhatsApp Business Manager](https://business.facebook.com/). The tool is available to all agents that have the WhatsApp Cloud channel bound to them.
+Templates must be pre-approved in the [Meta WhatsApp Business Manager](https://business.facebook.com/). Both tools are available to all agents that have the WhatsApp Cloud channel bound to them.
 
 ## Development
 
@@ -483,13 +543,14 @@ openclaw plugins install -l .
 
 ```
 src/
-  index.ts        — Plugin entry point + channel definition
+  index.ts        — Plugin entry point, channel definition, agent tools, auto-cleanup
   types.ts        — TypeScript interfaces
   api.ts          — Meta Cloud API client (outbound)
-  webhook.ts      — HTTP server (inbound webhooks)
+  webhook.ts      — HTTP server (inbound: direct + n8n relay, audit logging)
   crypto.ts       — HMAC-SHA256 signature verification
   setup.ts        — Interactive setup wizard
   runtime.ts      — OpenClaw runtime accessor
+  onboarding.ts   — Onboarding adapter
   __tests__/      — Vitest test suites
 ```
 
@@ -520,6 +581,15 @@ New WhatsApp Business accounts start at **250 unique recipients per 24 hours**. 
 
 **Plugin not found after `install -l .`:**
 - OpenClaw has a symlink discovery bug. Add `plugins.load.paths` to your config pointing to the plugin directory (see install instructions above)
+
+**n8n relay returns 503:**
+- No relay token file found at `~/.secrets/n8n/whatsapp-relay-token`. Create it with a random token and restart the gateway.
+
+**n8n relay returns 401:**
+- The bearer token in the n8n HTTP Request node doesn't match the token in `~/.secrets/n8n/whatsapp-relay-token`.
+
+**Duplicate "group" sessions appearing:**
+- Someone used `message send --channel whatsapp-cloud` or `message action=send channel=whatsapp-cloud` instead of the `whatsapp_send` tool. These artifacts are auto-cleaned on next gateway restart. Update agent instructions to use `whatsapp_send` exclusively.
 
 **Gateway won't start:**
 - Set `gateway.mode`: `openclaw config set gateway.mode local`
