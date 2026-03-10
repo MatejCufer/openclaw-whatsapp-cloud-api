@@ -706,7 +706,154 @@ const plugin = {
       });
 
       log.info("[whatsapp-cloud] Registered agent tool: whatsapp_send_template");
+
+      api.registerTool({
+        name: "whatsapp_send",
+        description:
+          "Send a WhatsApp text message directly via the Cloud API. Use this instead of 'message send' or 'exec openclaw message send' to avoid creating duplicate sessions. Automatically handles 24h window expiry by falling back to a template. Works from ANY session context (Telegram, WhatsApp, cron) without cross-context errors.",
+        parameters: {
+          type: "object",
+          properties: {
+            to: {
+              type: "string",
+              description:
+                "Recipient phone number (digits only or with +, e.g. 38631651745 or +38631651745)",
+            },
+            text: {
+              type: "string",
+              description: "The message text to send",
+            },
+          },
+          required: ["to", "text"],
+        },
+        async execute(_id: string, params: any) {
+          try {
+            const runtime = getWhatsAppCloudRuntime();
+            const cfg = await runtime.config.loadConfig();
+            const config = resolveConfig(cfg);
+
+            if (!config.accessToken || !config.phoneNumberId) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: "Error: WhatsApp Cloud API not configured (missing accessToken or phoneNumberId).",
+                  },
+                ],
+              };
+            }
+
+            const normalizedTo = String(params.to).replace(/[^0-9]/g, "");
+
+            if (!isWindowOpen(normalizedTo)) {
+              log.info?.(
+                `[whatsapp-cloud] 24h window expired for ${normalizedTo} — sending via template`
+              );
+              const templateResult = await sendTemplate(
+                config,
+                normalizedTo,
+                "monica_followup",
+                "en",
+                [
+                  {
+                    type: "body",
+                    parameters: [
+                      { type: "text", text: "there" },
+                      { type: "text", text: String(params.text).slice(0, 900) },
+                    ],
+                  },
+                ],
+                log
+              );
+
+              if (templateResult.ok) {
+                return {
+                  content: [
+                    {
+                      type: "text",
+                      text: `Sent to ${normalizedTo} via template (24h window expired). messageId: ${templateResult.messageId}`,
+                    },
+                  ],
+                };
+              }
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `Failed to send to ${normalizedTo}: ${templateResult.error}`,
+                  },
+                ],
+              };
+            }
+
+            const result = await sendText(config, normalizedTo, String(params.text), log);
+
+            if (result.ok) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `Sent to ${normalizedTo}. messageId: ${result.messageId}`,
+                  },
+                ],
+              };
+            }
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Failed to send to ${normalizedTo}: ${result.error}`,
+                },
+              ],
+            };
+          } catch (err: any) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Error sending WhatsApp message: ${err.message ?? err}`,
+                },
+              ],
+            };
+          }
+        },
+      });
+
+      log.info("[whatsapp-cloud] Registered agent tool: whatsapp_send");
     }
+
+    // Auto-cleanup: remove whatsapp-cloud:group: session artifacts on startup.
+    // These get created when the built-in `message send` tool is used instead of
+    // `whatsapp_send`. They fragment conversation history and cause info leakage.
+    try {
+      const runtime = getWhatsAppCloudRuntime();
+      const sessionsDir = join(
+        process.env.HOME ?? "/tmp",
+        ".openclaw", "agents", "monica", "sessions"
+      );
+      const sessionsPath = join(sessionsDir, "sessions.json");
+      try {
+        const raw = readFileSync(sessionsPath, "utf-8");
+        const store = JSON.parse(raw);
+        const staleKeys = Object.keys(store).filter(
+          (k) => k.includes("whatsapp-cloud:group:") || /^agent:monica:whatsapp:direct:/.test(k)
+        );
+        if (staleKeys.length > 0) {
+          for (const key of staleKeys) {
+            const entry = store[key];
+            const sessionFile = entry?.sessionFile;
+            if (sessionFile) {
+              try { const { unlinkSync } = require("node:fs"); unlinkSync(sessionFile); } catch {}
+            }
+            delete store[key];
+          }
+          writeFileSync(sessionsPath, JSON.stringify(store, null, 2));
+          log.info(
+            `[whatsapp-cloud] Auto-cleaned ${staleKeys.length} stale session artifact(s): ${staleKeys.join(", ")}`
+          );
+        }
+      } catch {}
+    } catch {}
 
     // Register CLI commands: `openclaw whatsapp-cloud setup|status|test`
     if (typeof api.registerCli === "function") {

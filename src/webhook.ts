@@ -1,8 +1,10 @@
 // ---------------------------------------------------------------------------
-// Webhook Server — receives inbound messages from Meta
+// Webhook Server — receives inbound messages from Meta (direct + n8n relay)
 // ---------------------------------------------------------------------------
 
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from "node:http";
+import { readFileSync, appendFileSync, mkdirSync } from "node:fs";
+import { join, dirname } from "node:path";
 import { verifyWebhookSignature } from "./crypto.js";
 import { markAsRead } from "./api.js";
 import type {
@@ -12,6 +14,41 @@ import type {
   WebhookContact,
   Logger,
 } from "./types.js";
+
+// ---------------------------------------------------------------------------
+// n8n relay token + audit log paths
+// ---------------------------------------------------------------------------
+
+const RELAY_TOKEN_PATH = join(
+  process.env.HOME ?? "/tmp",
+  ".secrets",
+  "n8n",
+  "whatsapp-relay-token"
+);
+const AUDIT_LOG_PATH = join(
+  process.env.HOME ?? "/tmp",
+  ".openclaw",
+  "whatsapp-cloud-audit.jsonl"
+);
+
+let relayToken: string | null = null;
+try {
+  relayToken = readFileSync(RELAY_TOKEN_PATH, "utf-8").trim();
+} catch {
+  // No relay token configured — relay path disabled
+}
+
+function writeAuditLog(entry: Record<string, unknown>): void {
+  try {
+    mkdirSync(dirname(AUDIT_LOG_PATH), { recursive: true });
+    appendFileSync(
+      AUDIT_LOG_PATH,
+      JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n"
+    );
+  } catch {
+    // Non-critical — never let audit logging break message processing
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -80,6 +117,12 @@ export function startWebhookServer(
       return;
     }
 
+    // ----- n8n relay path (POST) — bearer token auth, no Meta signature -----
+    if (req.method === "POST" && path === "/webhook/whatsapp-relay") {
+      await handleRelayed(req, res, config, onMessage, onStatus, log);
+      return;
+    }
+
     // ----- Health check -----
     if (req.method === "GET" && path === "/health") {
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -130,7 +173,7 @@ function handleVerification(
 }
 
 // ---------------------------------------------------------------------------
-// POST — process incoming webhook events
+// POST — process incoming webhook events (direct from Meta)
 // ---------------------------------------------------------------------------
 
 async function handleIncoming(
@@ -141,7 +184,6 @@ async function handleIncoming(
   onStatus: StatusUpdateHandler | undefined,
   log: Logger
 ): Promise<void> {
-  // Read body
   let rawBody = "";
   for await (const chunk of req) rawBody += chunk;
 
@@ -154,6 +196,7 @@ async function handleIncoming(
     const signature = req.headers["x-hub-signature-256"] as string | undefined;
     if (!verifyWebhookSignature(rawBody, signature, config.appSecret)) {
       log.warn("[whatsapp-cloud] Webhook signature verification FAILED — ignoring payload");
+      writeAuditLog({ event: "signature_failed", source: "direct" });
       return;
     }
   } else {
@@ -162,12 +205,67 @@ async function handleIncoming(
     );
   }
 
-  // Parse and process
+  processWebhookPayload(rawBody, "direct", config, onMessage, onStatus, log);
+}
+
+// ---------------------------------------------------------------------------
+// POST — process relayed webhook events (from n8n, bearer token auth)
+// ---------------------------------------------------------------------------
+
+async function handleRelayed(
+  req: IncomingMessage,
+  res: ServerResponse,
+  config: WhatsAppCloudConfig,
+  onMessage: InboundMessageHandler,
+  onStatus: StatusUpdateHandler | undefined,
+  log: Logger
+): Promise<void> {
+  let rawBody = "";
+  for await (const chunk of req) rawBody += chunk;
+
+  if (!relayToken) {
+    log.warn("[whatsapp-cloud] Relay request received but no relay token configured — rejecting");
+    writeAuditLog({ event: "relay_rejected", reason: "no_token_configured" });
+    res.writeHead(503, { "Content-Type": "text/plain" });
+    res.end("Relay not configured");
+    return;
+  }
+
+  const authHeader = req.headers["authorization"] ?? "";
+  const providedToken = authHeader.replace(/^Bearer\s+/i, "").trim();
+  if (providedToken !== relayToken) {
+    log.warn("[whatsapp-cloud] Relay request with invalid bearer token — rejecting");
+    writeAuditLog({ event: "relay_auth_failed", source: "relay" });
+    res.writeHead(401, { "Content-Type": "text/plain" });
+    res.end("Unauthorized");
+    return;
+  }
+
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("OK");
+
+  log.info("[whatsapp-cloud] Processing relayed webhook from n8n");
+  processWebhookPayload(rawBody, "n8n-relay", config, onMessage, onStatus, log);
+}
+
+// ---------------------------------------------------------------------------
+// Shared payload processing (used by both direct and relay paths)
+// ---------------------------------------------------------------------------
+
+function processWebhookPayload(
+  rawBody: string,
+  source: string,
+  config: WhatsAppCloudConfig,
+  onMessage: InboundMessageHandler,
+  onStatus: StatusUpdateHandler | undefined,
+  log: Logger
+): void {
   let payload: WebhookPayload;
   try {
     payload = JSON.parse(rawBody) as WebhookPayload;
   } catch (err) {
     log.error(`[whatsapp-cloud] Failed to parse webhook JSON: ${err}`);
+    writeAuditLog({ event: "parse_error", source, error: String(err) });
     return;
   }
 
@@ -182,26 +280,24 @@ async function handleIncoming(
 
       const { messages, contacts, statuses, errors } = change.value;
 
-      // Log errors
       if (errors?.length) {
         for (const err of errors) {
           log.error(
             `[whatsapp-cloud] Webhook error ${err.code}: ${err.title} — ${err.message}`
           );
+          writeAuditLog({ event: "webhook_error", source, code: err.code, title: err.title });
         }
       }
 
-      // Process status updates
       if (statuses?.length && onStatus) {
         for (const status of statuses) {
           onStatus(status.id, status.status, status.recipient_id);
         }
       }
 
-      // Process incoming messages
       if (messages?.length) {
         for (const msg of messages) {
-          processMessage(msg, contacts ?? [], config, onMessage, log);
+          processMessage(msg, contacts ?? [], config, onMessage, log, source);
         }
       }
     }
@@ -217,7 +313,8 @@ function processMessage(
   contacts: WebhookContact[],
   config: WhatsAppCloudConfig,
   onMessage: InboundMessageHandler,
-  log: Logger
+  log: Logger,
+  source: string = "direct"
 ): void {
   // Access control
   if (config.dmPolicy === "allowlist") {
@@ -225,15 +322,13 @@ function processMessage(
     const allowed = config.allowFrom.some((n) => normalizePhone(n) === normalized);
     if (!allowed) {
       log.info(`[whatsapp-cloud] Blocked message from ${msg.from} (not in allowlist)`);
+      writeAuditLog({ event: "blocked", source, from: msg.from, reason: "allowlist" });
       return;
     }
   }
 
-  // Resolve sender name
   const contact = contacts.find((c) => c.wa_id === msg.from);
   const senderName = contact?.profile?.name ?? msg.from;
-
-  // Extract text and media
   const parsed = extractMessageContent(msg);
 
   const inbound: ParsedInboundMessage = {
@@ -254,12 +349,20 @@ function processMessage(
     }`
   );
 
-  // Send read receipt
+  writeAuditLog({
+    event: "inbound",
+    source,
+    from: msg.from,
+    senderName,
+    type: msg.type,
+    messageId: msg.id,
+    textPreview: inbound.text.slice(0, 80),
+  });
+
   if (config.sendReadReceipts) {
     markAsRead(config, msg.id, log);
   }
 
-  // Dispatch to OpenClaw
   onMessage(inbound);
 }
 
