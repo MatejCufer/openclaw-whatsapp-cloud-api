@@ -391,6 +391,15 @@ const whatsappCloudChannel = {
         return;
       }
 
+      // Close existing webhook server before starting a new one (prevents EADDRINUSE on restart)
+      if (webhookServer) {
+        log.info?.("[whatsapp-cloud] Closing previous webhook server before restart");
+        try { webhookServer.close(); } catch {}
+        webhookServer = null;
+        // Brief delay to allow OS to release the port
+        await new Promise((r) => setTimeout(r, 500));
+      }
+
       // Validate config
       const validation = validateConfig(config);
       if (!validation.valid) {
@@ -501,6 +510,18 @@ const whatsappCloudChannel = {
           mode: "webhook",
         });
       }
+
+      // Keep the channel "alive" — resolve only when the server closes.
+      // Without this, OpenClaw treats the resolved promise as "channel stopped"
+      // and enters an auto-restart loop.
+      await new Promise<void>((resolve) => {
+        webhookServer!.on("close", resolve);
+        if (ctx.abortSignal) {
+          ctx.abortSignal.addEventListener("abort", () => {
+            webhookServer?.close();
+          }, { once: true });
+        }
+      });
     },
 
     logoutAccount: async ({ accountId, cfg }: { accountId: string; cfg: any }) => {

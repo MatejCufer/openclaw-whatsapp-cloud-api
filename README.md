@@ -265,6 +265,30 @@ systemctl --user start openclaw-gateway.service
 systemctl --user enable openclaw-gateway.service
 ```
 
+### systemd EnvironmentFile (important)
+
+If your `openclaw.json` uses `${ENV_VAR}` references for secrets, the systemd service must load the `.env` file. OpenClaw's `gateway install` does **not** add this automatically. Edit the service:
+
+```bash
+systemctl --user edit openclaw-gateway.service
+```
+
+Add `EnvironmentFile` **before** the existing `Environment=` lines:
+
+```ini
+[Service]
+EnvironmentFile=%h/.openclaw/.env
+```
+
+Then reload and restart:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user restart openclaw-gateway.service
+```
+
+Without this, environment variable references in the config resolve to empty strings, causing the channel to fail silently on startup.
+
 Make sure your `openclaw.json` loads the plugin from the cloned path:
 
 ```json
@@ -453,6 +477,14 @@ All webhook events (inbound messages, signature failures, relay auth failures, p
 
 On every gateway startup, the plugin scans the agent's `sessions.json` and removes any `whatsapp-cloud:group:` session artifacts and stale Baileys sessions. These artifacts are created when OpenClaw's built-in `message send` delivery system is used instead of the `whatsapp_send` tool, and would otherwise fragment conversation history across duplicate sessions.
 
+### Graceful restart handling
+
+The plugin properly handles OpenClaw's channel restart lifecycle:
+
+- **Port cleanup**: Before starting a new webhook server, any existing server is closed first. This prevents `EADDRINUSE` errors when the health-monitor or config reload triggers a channel restart.
+- **Keep-alive promise**: `startAccount` returns a long-lived promise that resolves only when the server closes. This tells OpenClaw the channel is still alive, preventing spurious auto-restart loops (OpenClaw treats a resolved `startAccount` promise as "channel stopped").
+- **Abort signal**: Listens on `ctx.abortSignal` so the gateway can cleanly shut down the channel on `stopChannel` or process exit.
+
 ### Security
 
 - HMAC-SHA256 webhook signature verification (via App Secret)
@@ -590,6 +622,17 @@ New WhatsApp Business accounts start at **250 unique recipients per 24 hours**. 
 
 **Duplicate "group" sessions appearing:**
 - Someone used `message send --channel whatsapp-cloud` or `message action=send channel=whatsapp-cloud` instead of the `whatsapp_send` tool. These artifacts are auto-cleaned on next gateway restart. Update agent instructions to use `whatsapp_send` exclusively.
+
+**EADDRINUSE: address already in use :::3100:**
+- This happens when the channel restarts without closing the previous webhook server. Update to the latest plugin version — the fix is in `startAccount` (closes the old server before binding a new one).
+- Can also happen if another process holds port 3100: `ss -tlnp | grep 3100`
+
+**Channel enters auto-restart loop (attempt N/10):**
+- If `startAccount` resolves immediately, OpenClaw treats the channel as "stopped" and retries. The plugin now returns a long-lived promise that keeps the channel alive. Update to the latest version.
+- If the loop persists after updating: check that WhatsApp credentials are present and valid. Missing env vars cause the channel to fail validation and exit `startAccount` early.
+
+**WhatsApp env vars empty despite being in .env:**
+- The systemd service must explicitly load the `.env` file via `EnvironmentFile`. See the "systemd EnvironmentFile" section above.
 
 **Gateway won't start:**
 - Set `gateway.mode`: `openclaw config set gateway.mode local`
